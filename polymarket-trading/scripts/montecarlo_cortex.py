@@ -118,45 +118,60 @@ def get_clob_client():
     return ClobClient("https://clob.polymarket.com", key=pk, chain_id=137, creds=creds, signature_type=2, funder=proxy)
 
 def update_real_balance(client):
+    """Actualiza TOTAL_ACCOUNT_VALUE con USDC en wallet + valor posiciones. Funciona desde AWS con múltiples RPCs."""
     global SIMULATION_DATA
     proxy = os.getenv("PROXY_ADDRESS", "0x1294d2B89B08E8651124F04534FB2715a1437846")
     usdc_address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-    
-    # Lista de RPCs robustos para evitar bloqueos 403
+    request_timeout = 12  # AWS puede ser más lento; evitar timeouts cortos
+
+    # Muchos RPCs públicos para Polygon (desde AWS algunos fallan o bloquean)
     RPC_FALLBACKS = [
+        "https://polygon-rpc.com",
+        "https://polygon.drpc.org",
         "https://rpc.ankr.com/polygon",
+        "https://1rpc.io/matic",
+        "https://polygon-bor-rpc.publicnode.com",
         "https://polygon-mainnet.public.blastapi.io",
-        "https://polygon-bor-rpc.publicnode.com"
+        "https://polygon.api.onfinality.io/public",
+        "https://polygon-public.nodies.app",
+        "https://polygon.llamarpc.com",
+        "https://polygon-mainnet.core.chainstack.com/archive",
     ]
-    
+
     abi = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
-    
+
     while True:
-        success = False
+        cash = None
         for rpc_url in RPC_FALLBACKS:
             try:
-                w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 5}))
+                w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": request_timeout}))
                 usdc_contract = w3.eth.contract(address=Web3.to_checksum_address(usdc_address), abi=abi)
-                
-                # 1. Obtener Cash
                 balance_raw = usdc_contract.functions.balanceOf(Web3.to_checksum_address(proxy)).call()
                 cash = balance_raw / 1e6
-                
-                # 2. Obtener Valor de Posiciones
-                url = f"https://gamma-api.polymarket.com/positions?user={proxy.lower()}"
-                r = requests.get(url, timeout=5).json()
-                pos_val = sum([float(p.get('size',0)) * float(p.get('price',0)) for p in r])
-                
-                SIMULATION_DATA["current_balance"] = round(cash + pos_val, 2)
-                success = True
-                break # Si funciona, cortamos el loop de fallbacks
+                log.info(f"Balance USDC: ${cash:.2f} (RPC: {rpc_url.split('/')[2][:20]}...)")
+                break
             except Exception as e:
-                log.debug(f"RPC {rpc_url} falló: {e}")
-                continue 
-        
-        if not success:
-            log.warning("Telemetría de balance en espera (Bloqueo de red en AWS). Reintentando...")
-            
+                log.debug(f"RPC {rpc_url[:40]}... falló: {e}")
+                continue
+
+        pos_val = 0.0
+        if cash is not None:
+            try:
+                url = f"https://gamma-api.polymarket.com/positions?user={proxy.lower()}"
+                r = requests.get(url, timeout=request_timeout)
+                r.raise_for_status()
+                data = r.json()
+                pos_val = sum([float(p.get("size", 0)) * float(p.get("price", 0)) for p in data])
+            except Exception as e:
+                log.debug(f"Gamma positions falló: {e}")
+                # Mostramos al menos el cash
+
+        if cash is not None:
+            SIMULATION_DATA["current_balance"] = round(cash + pos_val, 2)
+            SIMULATION_DATA["last_update"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        else:
+            log.warning("Telemetría de balance: todos los RPC fallaron. Reintentando en 30s...")
+
         time.sleep(30)
 
 def neural_engine_loop():

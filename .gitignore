@@ -1,6 +1,10 @@
 # Carpeta de configuración de OpenClaw (CUIDADO: SENSITIVO)
 .openclaw/
 *.env
+.env.*
+*.pem
+*credentials*
+*secret*
 
 # Python
 __pycache__/

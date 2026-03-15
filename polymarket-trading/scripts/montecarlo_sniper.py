@@ -1,10 +1,12 @@
 import os
+import sys
 import time
 import json
 import logging
 import math
 import numpy as np
 import requests
+import fcntl
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
@@ -13,15 +15,27 @@ from py_clob_client.clob_types import OrderArgs, ApiCreds
 from web3 import Web3
 
 # ═══════════════════════════════════════════════════════════════════
-# MONTE CARLO SNIPER - RUTA AL MILLÓN ($50 -> $1M)
-# ═══════════════════════════════════════════════════════════════════
-# Estrategia: 
-# 1. Escanea mercados binarios de 5-min/15-min de Cripto (BTC, ETH).
-# 2. Calcula la Volatilidad Histórica (HV) real usando datos de Binance.
-# 3. Simula 10,000 trayectorias de precio mediante Movimiento Browniano Geométrico (GBM).
-# 4. Obtiene la "Probabilidad Verdadera" matemática.
-# 5. Compara con los precios (asks) de Polymarket. Si hay un EDGE significativo, entra con Kelly Criterion.
-# ═══════════════════════════════════════════════════════════════════
+TRADES_LOG_FILE = os.path.expanduser("~/trades_history.json")
+TRADED_MARKETS_FILE = os.path.expanduser("~/.openclaw/workspace/skills/polymarket/traded_markets.json")
+LOCK_FILE = os.path.expanduser("~/.openclaw/workspace/skills/polymarket/.sniper.lock")
+
+def log_trade_to_file(trade_data):
+    try:
+        history = []
+        if os.path.exists(TRADES_LOG_FILE):
+            with open(TRADES_LOG_FILE, "r") as f:
+                history = json.load(f)
+        history.append(trade_data)
+        with open(TRADES_LOG_FILE, "w") as f:
+            json.dump(history, f, indent=4)
+    except Exception as e:
+        log.error(f"Error guardando auditoría de trade: {e}")
+
+LAST_REDEEM_TIME = 0
+
+def auto_redeem_if_needed(client):
+    # Temporalmente desactivado mientras verificamos la función correcta en la librería
+    pass
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger("MonteCarloSniper")
@@ -43,14 +57,57 @@ def send_telegram(msg):
 GAMMA_API = "https://gamma-api.polymarket.com"
 PROXY_ADDRESS = os.getenv("PROXY_ADDRESS", "0x1294d2B89B08E8651124F04534FB2715a1437846")
 
-# Parámetros de Riesgo (ESTRICTOS v4.1)
-MAX_TRADE_USD = 1.00      # HARD CAP: Prohibido pasar de $1 USD
+# Parámetros de Crecimiento Acelerado (v5.7 - Objetivo $1M)
+MAX_TRADE_USD = 10.00     # PROTEGIDO: $10.00 para balance de $315
 MAX_RISK_PER_TRADE = 0.05 # Máximo 5% del bankroll real
-MIN_EDGE_REQUIRED = 0.15  # 15% de ventaja matemática
+MIN_EDGE_REQUIRED = 0.07  # AJUSTADO: 7% de ventaja (Mayor frecuencia de trades)
 SIMULACIONES = 10000      
-TRADED_MARKETS = set()    # MEMORIA: No repetir mercados
+TRADED_MARKETS = set()    # MEMORIA: No repetir mercados (también persistido en disco)
 
 BINANCE_TICKERS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
+
+
+def load_traded_markets():
+    """Carga mercados ya operados desde disco (evita doble orden tras reinicio)."""
+    global TRADED_MARKETS
+    try:
+        if os.path.exists(TRADED_MARKETS_FILE):
+            with open(TRADED_MARKETS_FILE, "r") as f:
+                data = json.load(f)
+                TRADED_MARKETS = set(data.get("market_ids", []))
+                if TRADED_MARKETS:
+                    log.info(f"Cargados {len(TRADED_MARKETS)} mercados ya operados (evitar doble orden)")
+    except Exception as e:
+        log.warning(f"No se pudo cargar traded_markets: {e}")
+
+
+def save_traded_markets():
+    """Persiste TRADED_MARKETS a disco tras cada operación."""
+    try:
+        dirname = os.path.dirname(TRADED_MARKETS_FILE)
+        if dirname and not os.path.isdir(dirname):
+            os.makedirs(dirname, exist_ok=True)
+        with open(TRADED_MARKETS_FILE, "w") as f:
+            json.dump({"market_ids": list(TRADED_MARKETS), "updated": datetime.now(timezone.utc).isoformat()}, f, indent=2)
+    except Exception as e:
+        log.error(f"Error guardando traded_markets: {e}")
+
+
+def acquire_lock():
+    """Lock file para una sola instancia. Si ya hay otra corriendo, sale."""
+    try:
+        dirname = os.path.dirname(LOCK_FILE)
+        if dirname and not os.path.isdir(dirname):
+            os.makedirs(dirname, exist_ok=True)
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Escribir PID para diagnóstico
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        return fd
+    except (OSError, BlockingIOError):
+        log.error("Otra instancia del sniper ya está corriendo (lock activo). Salida.")
+        sys.exit(1)
 
 def get_clob_client():
     pk = os.getenv("POLYMARKET_PRIVATE_KEY")
@@ -125,9 +182,9 @@ def scan_and_trade(client):
     log.info("🔍 Escaneando mercados para simulación Monte Carlo...")
     now = datetime.now(timezone.utc)
     
-    # Filtro: Mercados que acaban en los próximos 15 mins (Binary)
+    # Filtro: Mercados que acaban en los próximos 25 mins
     min_dt = now.strftime('%Y-%m-%dT%H:%M:%SZ')
-    max_dt = (now + timedelta(minutes=15)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    max_dt = (now + timedelta(minutes=25)).strftime('%Y-%m-%dT%H:%M:%SZ')
     url = f"{GAMMA_API}/events?limit=50&tag_id=102892&active=true&closed=false&end_date_min={min_dt}&end_date_max={max_dt}"
     
     try:
@@ -149,8 +206,9 @@ def scan_and_trade(client):
                 end_dt = datetime.fromisoformat(mkt.get("endDate").replace('Z', '+00:00'))
                 time_left_sec = (end_dt - now).total_seconds()
                 
-                # Ignorar si quedan menos de 30s (las subastas cierran la liquidez)
-                if time_left_sec < 30 or time_left_sec > 900:
+                # ESTRATEGIA v4.4: Solo 10-15 mins (Ignorar bajo 7 mins)
+                # Esto da tiempo a que la estadística se estabilice.
+                if time_left_sec < 420 or time_left_sec > 1200:
                     continue
                 
                 mkt_id = mkt.get("id")
@@ -166,8 +224,9 @@ def scan_and_trade(client):
                 
                 price_to_beat = price_to_beat_raw if price_to_beat_raw > 0 else current_px
                 
-                # Simular!
-                mc_prob_yes = monte_carlo_probability(current_px, price_to_beat, time_left_sec, vol, drift/10) # Suavizamos el drift a corto plazo
+                # Simular! (v5.1 Motor de Máxima Velocidad: 100% de tendencia)
+                # Seguimos la tendencia real al 100% para capturar momentum.
+                mc_prob_yes = monte_carlo_probability(current_px, price_to_beat, time_left_sec, vol, drift) 
                 mc_prob_no = 1.0 - mc_prob_yes
                 
                 log.info(f"🎲 [{ticker}] MC Sim -> YES: {mc_prob_yes:.1%} | NO: {mc_prob_no:.1%} | Quedan {time_left_sec:.0f}s (Dif: {current_px - price_to_beat:.2f})")
@@ -188,6 +247,8 @@ def scan_and_trade(client):
                 ask_price = 0
                 token_to_buy = None
                 
+                # NO vs YES: lo decide solo el edge (prob MC vs libro). Si precio actual < priceToBeat,
+                # la simulación suele dar prob_yes < 50% → edge en NO. Si precio > target → más YES.
                 if edge_yes > MIN_EDGE_REQUIRED and ask_yes < 0.85:
                     side_to_buy = "YES"
                     best_edge = edge_yes
@@ -229,51 +290,88 @@ def scan_and_trade(client):
                     except:
                         current_bankroll = 1.0 
                     
-                    trade_usd = 1.00 
-                    
-                    if trade_usd > current_bankroll: 
-                         log.warning(f"Saldo insuficiente: trade ${trade_usd} > balance ${current_bankroll}")
-                         continue
-                    
-                    if trade_usd > 10.0: # Triple Check: Jamas pasar de $10 aunque el saldo sea alto
-                         trade_usd = 1.0
-                         
+                    # CAP ESTRICTO: máximo MAX_TRADE_USD ($10) en coste Y máximo 10 shares (lo que muestra Polymarket como "Apuesta")
+                    # Así "Apuesta" en la UI nunca supera $10 y el coste real tampoco.
+                    max_shares = 10.0
+                    trade_usd = MAX_TRADE_USD
+
+                    if trade_usd > current_bankroll or trade_usd < 1.0:
+                        log.warning(f"Saldo insuficiente: trade ${trade_usd} > balance ${current_bankroll}")
+                        continue
+
                     shares = round(trade_usd / ask_price, 2)
-                    
-                    # CORRECCIÓN DE CUMPLIMIENTO (v4.3): 
-                    # Polymarket CLOB requiere un mínimo de 5 unidades (shares) para muchos mercados.
+                    # Nunca más de 10 shares: evita que Polymarket muestre "Apuesta: $19" (notional = shares)
+                    shares = min(shares, max_shares)
+                    trade_usd = round(shares * ask_price, 2)
+
+                    # Mínimo 5 shares para que el CLOB acepte (sin superar 10)
                     if shares < 5.0:
-                        shares = 5.0
+                        shares = min(5.0, max_shares)
                         trade_usd = round(shares * ask_price, 2)
-                        log.info(f"Ajustando unidades a 5.0 (mínimo CLOB). Nueva inversión: ${trade_usd}")
-                    
+                        log.info(f"Ajustando a mínimo 5 shares. Inversión: ${trade_usd:.2f}")
+
+                    # Tope final: por si acaso, nunca más de MAX_TRADE_USD ni más de max_shares
+                    if trade_usd > MAX_TRADE_USD:
+                        trade_usd = MAX_TRADE_USD
+                        shares = min(round(trade_usd / ask_price, 2), max_shares)
+                        trade_usd = round(shares * ask_price, 2)
+                    if shares > max_shares:
+                        shares = max_shares
+                        trade_usd = round(shares * ask_price, 2)
+
                     # Log de auditoría
-                    log.info(f"💰 Ejecutando trade: ${trade_usd} usd en {side_to_buy} (Bankroll: ${current_bankroll:.2f})")
+                    log.info(f"💰 Ejecutando trade: ${trade_usd:.2f} USD ({shares} shares @ {ask_price:.3f}) en {side_to_buy} | Bankroll: ${current_bankroll:.2f}")
                     
                     # Descomentar para activar trading real:
                     try:
                         order = client.create_order(OrderArgs(price=ask_price, size=shares, side="BUY", token_id=token_to_buy))
                         resp = client.post_order(order)
                         log.info(f"✅ ORDEN REAL ENVIADA: {resp}")
-                        msg = f"🚀 COMPRA EJECUTADA\nMercado: {ticker} ({side_to_buy})\nPrecio: {ask_price}\nInversión: ${trade_usd} USD\nProb MC: {mc_prob:.1%}"
+                        msg = f"🚀 COMPRA EJECUTADA\nMercado: {ticker} ({side_to_buy})\nPrecio: {ask_price} | {shares} shares\nInversión: ${trade_usd:.2f} USD (máx $10)\nProb MC: {mc_prob:.1%}"
                         send_telegram(msg)
-                        TRADED_MARKETS.add(mkt_id) # Bloquear mercado para no repetir
+                        
+                        # Auditoría: registrar en disco ANTES de añadir a TRADED_MARKETS (orden único)
+                        log_trade_to_file({
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "market_id": mkt_id,
+                            "market": ticker,
+                            "side": side_to_buy,
+                            "price": ask_price,
+                            "investment": trade_usd,
+                            "shares": shares,
+                            "prob_mc": mc_prob,
+                            "order_id": resp.get("orderID"),
+                        })
+                        TRADED_MARKETS.add(mkt_id)
+                        save_traded_markets()
                     except Exception as e:
                         log.error(f"Falla ejecutando orden real: {e}")
                     
-                    # Pausa para no spam
-                    time.sleep(10)
+                    # Pausa para no spam y límite de exposición (v5.8 - Cooldown 30s)
+                    # Solo permitimos UN trade por ciclo de escaneo para evitar stacking.
+                    time.sleep(30)
+                    return # Salimos del escaneo actual tras operar
 
             except Exception as e:
                 log.error(f"Error procesando mercado: {e}")
 
 def main():
     log.info("Iniciando Motor Cuantitativo Monte Carlo de Polymarket...")
+    lock_fd = acquire_lock()
+    load_traded_markets()
     client = get_clob_client()
-    
-    while True:
-        scan_and_trade(client)
-        time.sleep(3)
+    try:
+        while True:
+            auto_redeem_if_needed(client)
+            scan_and_trade(client)
+            time.sleep(3)
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()

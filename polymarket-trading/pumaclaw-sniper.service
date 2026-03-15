@@ -1,0 +1,16 @@
+[Unit]
+Description=PumaClaw Monte Carlo Sniper (Polymarket)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/ubuntu/.openclaw/workspace/skills/polymarket/.venv/bin/python3 /home/ubuntu/.openclaw/workspace/skills/polymarket/scripts/montecarlo_sniper.py
+Restart=always
+RestartSec=30
+WorkingDirectory=/home/ubuntu/.openclaw/workspace/skills/polymarket/scripts
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:/home/ubuntu/sniper_v5.log
+StandardError=append:/home/ubuntu/sniper_v5.log
+
+[Install]
+WantedBy=default.target
