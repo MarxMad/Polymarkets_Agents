@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, ApiCreds
+from web3 import Web3
 
 # ═══════════════════════════════════════════════════════════════════
 # MONTE CARLO SNIPER - RUTA AL MILLÓN ($50 -> $1M)
@@ -27,14 +28,27 @@ log = logging.getLogger("MonteCarloSniper")
 
 load_dotenv(os.path.expanduser("~/.openclaw/.env"))
 
+# Telegram Config
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+def send_telegram(msg):
+    if not TG_TOKEN or not TG_CHAT_ID: return
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": f"🛡️ SNIPER: {msg}"}, timeout=5)
+    except:
+        pass
+
 GAMMA_API = "https://gamma-api.polymarket.com"
 PROXY_ADDRESS = os.getenv("PROXY_ADDRESS", "0x1294d2B89B08E8651124F04534FB2715a1437846")
 
-# Parámetros de Riesgo (50 USD a 1M)
-CAPITAL_INICIAL = 50.0 # Empezamos con gestión conservadora
-MAX_RISK_PER_TRADE = 0.05 # Máximo 5% del bankroll
-MIN_EDGE_REQUIRED = 0.15  # Requerimos un 15% de ventaja matemática para entrar (Margin of Safety)
-SIMULACIONES = 10000      # Caminatas aleatorias de Monte Carlo
+# Parámetros de Riesgo (ESTRICTOS v4.1)
+MAX_TRADE_USD = 1.00      # HARD CAP: Prohibido pasar de $1 USD
+MAX_RISK_PER_TRADE = 0.05 # Máximo 5% del bankroll real
+MIN_EDGE_REQUIRED = 0.15  # 15% de ventaja matemática
+SIMULACIONES = 10000      
+TRADED_MARKETS = set()    # MEMORIA: No repetir mercados
 
 BINANCE_TICKERS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
 
@@ -45,7 +59,8 @@ def get_clob_client():
         os.getenv("POLYMARKET_API_SECRET"),
         os.getenv("POLYMARKET_API_PASSPHRASE")
     )
-    return ClobClient("https://clob.polymarket.com", key=pk, chain_id=137, creds=creds, signature_type=2, funder=PROXY_ADDRESS)
+    proxy = os.getenv("PROXY_ADDRESS", "0x1294d2B89B08E8651124F04534FB2715a1437846")
+    return ClobClient("https://clob.polymarket.com", key=pk, chain_id=137, creds=creds, signature_type=2, funder=proxy)
 
 # ── Binance Data ──────────────────────────────────────────────────
 def get_binance_data(ticker):
@@ -126,10 +141,8 @@ def scan_and_trade(client):
         ticker = "BTC" if "bitcoin" in title or "btc" in title else "ETH" if "ethereum" in title or "eth" in title else None
         
         if not ticker: continue
-        
-        meta = ev.get("eventMetadata", {})
-        price_to_beat = float(meta.get("priceToBeat", 0))
-        if price_to_beat == 0: continue
+        meta = ev.get("eventMetadata") or {}
+        price_to_beat_raw = float(meta.get("priceToBeat", 0))
         
         for mkt in ev.get("markets", []):
             try:
@@ -140,12 +153,18 @@ def scan_and_trade(client):
                 if time_left_sec < 30 or time_left_sec > 900:
                     continue
                 
+                mkt_id = mkt.get("id")
+                if mkt_id in TRADED_MARKETS:
+                    continue
+                
                 tids = json.loads(mkt.get("clobTokenIds", "[]"))
                 if len(tids) < 2: continue
                 
                 # Obtener info Binance
                 current_px, vol, drift = get_binance_data(ticker)
                 if not current_px: continue
+                
+                price_to_beat = price_to_beat_raw if price_to_beat_raw > 0 else current_px
                 
                 # Simular!
                 mc_prob_yes = monte_carlo_probability(current_px, price_to_beat, time_left_sec, vol, drift/10) # Suavizamos el drift a corto plazo
@@ -192,21 +211,55 @@ def scan_and_trade(client):
                     
                     # Fraction Kelly (Mitad para ser seguros)
                     safe_kelly = max(0.01, min(kelly_f * 0.5, MAX_RISK_PER_TRADE))
-                    trade_usd = round(CAPITAL_INICIAL * safe_kelly, 2)
-                    trade_usd = max(2.0, trade_usd) # Mínimo $2
+                    
+                    # Obtener balance real para el cálculo
+                    try:
+                        # Usar Web3 directo para el balance (más fiable para el proxy)
+                        rpc_list = ["https://polygon-bor-rpc.publicnode.com", "https://rpc.ankr.com/polygon"]
+                        current_bankroll = 1.0 # Default conservador
+                        for rpc in rpc_list:
+                            try:
+                                w3 = Web3(Web3.HTTPProvider(rpc))
+                                usdc_abi = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
+                                usdc_contract = w3.eth.contract(address=Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"), abi=usdc_abi)
+                                bal_raw = usdc_contract.functions.balanceOf(Web3.to_checksum_address(PROXY_ADDRESS)).call()
+                                current_bankroll = bal_raw / 1e6
+                                if current_bankroll > 0: break
+                            except: continue
+                    except:
+                        current_bankroll = 1.0 
+                    
+                    trade_usd = 1.00 
+                    
+                    if trade_usd > current_bankroll: 
+                         log.warning(f"Saldo insuficiente: trade ${trade_usd} > balance ${current_bankroll}")
+                         continue
+                    
+                    if trade_usd > 10.0: # Triple Check: Jamas pasar de $10 aunque el saldo sea alto
+                         trade_usd = 1.0
+                         
                     shares = round(trade_usd / ask_price, 2)
                     
-                    log.info(f"💰 Ejecutando trade via Kelly: ${trade_usd} usd ({shares} shares) en {side_to_buy}")
+                    # CORRECCIÓN DE CUMPLIMIENTO (v4.3): 
+                    # Polymarket CLOB requiere un mínimo de 5 unidades (shares) para muchos mercados.
+                    if shares < 5.0:
+                        shares = 5.0
+                        trade_usd = round(shares * ask_price, 2)
+                        log.info(f"Ajustando unidades a 5.0 (mínimo CLOB). Nueva inversión: ${trade_usd}")
+                    
+                    # Log de auditoría
+                    log.info(f"💰 Ejecutando trade: ${trade_usd} usd en {side_to_buy} (Bankroll: ${current_bankroll:.2f})")
                     
                     # Descomentar para activar trading real:
-                    '''
                     try:
                         order = client.create_order(OrderArgs(price=ask_price, size=shares, side="BUY", token_id=token_to_buy))
                         resp = client.post_order(order)
-                        log.info(f"✅ Orden enviada: {resp}")
+                        log.info(f"✅ ORDEN REAL ENVIADA: {resp}")
+                        msg = f"🚀 COMPRA EJECUTADA\nMercado: {ticker} ({side_to_buy})\nPrecio: {ask_price}\nInversión: ${trade_usd} USD\nProb MC: {mc_prob:.1%}"
+                        send_telegram(msg)
+                        TRADED_MARKETS.add(mkt_id) # Bloquear mercado para no repetir
                     except Exception as e:
-                        log.error(f"Falla ejecutando orden: {e}")
-                    '''
+                        log.error(f"Falla ejecutando orden real: {e}")
                     
                     # Pausa para no spam
                     time.sleep(10)

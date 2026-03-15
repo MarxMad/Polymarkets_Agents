@@ -1,0 +1,22 @@
+# Carpeta de configuración de OpenClaw (CUIDADO: SENSITIVO)
+.openclaw/
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Logs
+*.log
+sniper.log
+
+# Dashboard
+.dash-connection/
+
+# Mac
+.DS_Store
