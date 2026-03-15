@@ -1,0 +1,25 @@
+{
+  "bankroll_usd": 38.410889,
+  "max_bet_pct": 0.25,
+  "min_liquidity": 2000,
+  "min_volume_24h": 500,
+  "kelly_fraction": 0.25,
+  "scan_interval_min": 15,
+  "tags": [
+    "Crypto",
+    "Bitcoin",
+    "Ethereum",
+    "Solana",
+    "Polymarket",
+    "Politics",
+    "Sports"
+  ],
+  "min_ev_threshold": 0.05,
+  "min_price": 0.05,
+  "max_price": 0.95,
+  "min_confidence": 0.6,
+  "max_days_to_resolution": 15,
+  "peak_bankroll": 44.79312,
+  "dry_run": false,
+  "self_healing": true
+}

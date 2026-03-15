@@ -1,0 +1,14 @@
+[Unit]
+Description=PumaClaw Blind Sniper (10 cents telemetry)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/ubuntu/.venv/bin/python3 /home/ubuntu/.openclaw/workspace/skills/polymarket/scripts/blind_sniper.py
+Restart=always
+RestartSec=60
+WorkingDirectory=/home/ubuntu/.openclaw/workspace/skills/polymarket/scripts
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

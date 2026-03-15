@@ -1,0 +1,15 @@
+[Unit]
+Description=PumaClaw Autonomous Polymarket Trader
+After=openclaw-gateway.service
+
+[Service]
+Type=simple
+Environment=HOME=/home/ubuntu
+EnvironmentFile=/home/ubuntu/.openclaw/.env
+ExecStart=/home/ubuntu/.venv/bin/python3 /home/ubuntu/.openclaw/workspace/skills/polymarket/scripts/trader.py
+WorkingDirectory=/home/ubuntu/.openclaw/workspace/skills/polymarket
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target

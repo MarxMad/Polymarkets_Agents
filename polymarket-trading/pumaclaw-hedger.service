@@ -1,0 +1,14 @@
+[Unit]
+Description=PumaClaw AI Binary Hedger
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/.openclaw/workspace/skills/polymarket/scripts
+ExecStart=/home/ubuntu/.venv/bin/python3 /home/ubuntu/.openclaw/workspace/skills/polymarket/scripts/binary_hedger.py
+Restart=always
+RestartSec=10
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=default.target

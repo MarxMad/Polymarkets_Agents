@@ -1,0 +1,8 @@
+[Unit]
+Description=PumaClaw Daily Account Report
+After=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/home/ubuntu/.openclaw/.env
+ExecStart=/home/ubuntu/.venv/bin/python3 /home/ubuntu/.openclaw/workspace/skills/polymarket/scripts/trader.py --report --notify

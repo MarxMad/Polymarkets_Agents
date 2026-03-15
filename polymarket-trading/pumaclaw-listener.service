@@ -1,0 +1,13 @@
+[Unit]
+Description=PumaClaw Telegram Command Listener (Claude Code Bridge)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/.openclaw/workspace
+ExecStart=/home/ubuntu/.venv/bin/python3 /home/ubuntu/.openclaw/workspace/skills/polymarket/scripts/listener.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
