@@ -1,0 +1,17 @@
+[Unit]
+Description=PumaClaw Orderbook Recorder (Polymarket)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/.openclaw/workspace/skills/polymarket
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/.openclaw/workspace/skills/polymarket/.venv/bin/python3 /home/ubuntu/.openclaw/workspace/skills/polymarket/scripts/orderbook_recorder.py
+Restart=always
+RestartSec=2
+StandardOutput=append:/home/ubuntu/orderbook_recorder.log
+StandardError=append:/home/ubuntu/orderbook_recorder.log
+
+[Install]
+WantedBy=default.target
+
