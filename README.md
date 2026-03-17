@@ -132,6 +132,68 @@ El proyecto incluye documentación técnica y simulaciones para evaluar viabilid
 
 Scripts asociados a la simulación 2: `orderbook_recorder.py` (graba orderbook en JSONL), `analyze_doublecheap_straddle.py` (analiza hits y PnL teórico). Ver el doc para variables de entorno y cómo ejecutar.
 
+### Simulación 2: Double-Cheap Straddle (datos reales)
+
+Estrategia alternativa: comprar **YES y NO** cuando cada uno cotice por debajo de un umbral (ej. 0.30–0.35). Al resolver, una pierna paga 1 USD/share y la otra 0; si ambas se compraron barato, el PnL teórico es positivo. Todo se mide con **snapshots reales del orderbook** del CLOB.
+
+**Pipeline de datos:**
+
+```mermaid
+flowchart LR
+  subgraph Fuentes
+    A[Gamma API<br/>eventos 5M]
+    B[CLOB Polymarket<br/>order book]
+  end
+  subgraph Captura
+    C[orderbook_recorder.py]
+    D[orderbook_snapshots.jsonl]
+  end
+  subgraph Análisis
+    E[analyze_doublecheap_straddle.py]
+    F[Hits 0/1/2 piernas<br/>Orden YES→NO / NO→YES<br/>PnL teórico]
+  end
+  A --> C
+  B --> C
+  C --> D
+  D --> E
+  E --> F
+```
+
+**Lógica de la estrategia:**
+
+```mermaid
+flowchart TD
+  M[Mercado 5M Up/Down] --> P{Precio se aleja<br/>del target}
+  P --> |Sí| U[Una pierna se abarata<br/>ask ≤ 0.30–0.35]
+  U --> V{Precio vuelve<br/>y cruza target}
+  V --> |Sí| D[La otra pierna<br/>también se abarata]
+  D --> L[Órdenes límite<br/>YES y NO baratas]
+  L --> R[Al resolver: una paga 1, otra 0]
+  R --> PNL[PnL teórico positivo<br/>si coste total &lt; payout]
+  P --> |No| N[Sin oportunidad]
+  V --> |No| N
+```
+
+**Última corrida (datos reales):** 222.641 snapshots · 296 markets únicos.
+
+| Umbral | Hits 2 piernas | Frecuencia | Orden YES→NO / NO→YES | PnL medio (2 piernas) |
+|--------|-----------------|------------|------------------------|------------------------|
+| **0.30** | 50 | 16.9% | 24 / 26 | **+1.74 USD** |
+| 0.31 | 54 | 18.2% | 25 / 29 | +1.67 USD |
+| 0.32 | 61 | 20.6% | 27 / 34 | +1.51 USD |
+| 0.33 | 65 | 22.0% | 31 / 34 | +1.38 USD |
+| 0.34 | 70 | 23.6% | 31 / 39 | +1.26 USD |
+| **0.35** | 78 | **26.4%** | 35 / 43 | +1.16 USD |
+
+```mermaid
+pie showData title Distribución de outcomes (umbral 0.30)
+  "Hits 2 piernas" : 50
+  "Hits 1 pierna" : 231
+  "Hits 0" : 15
+```
+
+Documentación completa: [docs/SIMULACION_DOUBLE_CHEAP_STRADDLE.md](docs/SIMULACION_DOUBLE_CHEAP_STRADDLE.md).
+
 ---
 
 ## 🧭 Visión general
