@@ -40,6 +40,73 @@
 
 ---
 
+## 🎯 Estrategia en producción: Monte Carlo Sniper
+
+**Nombre oficial:** **Monte Carlo Sniper**
+
+Estrategia cuantitativa que opera en mercados binarios 5M de BTC/ETH en Polymarket. Usa **simulación Monte Carlo (GBM)** para estimar la probabilidad real de que el precio quede por encima del target al cierre; si esa probabilidad supera al precio del libro en un **edge** mínimo, el bot compra **una sola pierna** (YES o NO) por señal.
+
+| Aspecto | Detalle |
+|--------|---------|
+| **Mercados** | Binarios 5M (tag 102892), BTC y ETH |
+| **Resolución** | Cierre de vela 1m en Binance (BTCUSDT/ETHUSDT) |
+| **Script** | `polymarket-trading/scripts/montecarlo_sniper.py` |
+| **Dashboard** | `polymarket-trading/scripts/montecarlo_cortex.py` (puerto 8050) |
+| **Tamaño** | Máx. 1 USD y 2 shares por operación (configurable) |
+
+**Flujo resumido:** Gamma API (mercados activos) → Binance (precio, volatilidad, drift) → Monte Carlo GBM (10k caminos) → probabilidad YES/NO → comparación con ask del libro → si hay edge, una orden de compra → registro en `trades_history.json` y cooldown.
+
+**Pipeline de datos:**
+
+```mermaid
+flowchart LR
+  subgraph Fuentes
+    A[Gamma API<br/>eventos 5M]
+    B[Binance<br/>precio, σ, drift]
+    C[CLOB Polymarket<br/>order book]
+  end
+  subgraph Sniper
+    D[montecarlo_sniper.py]
+    E[GBM 10k caminos]
+    F[prob YES/NO]
+    G{Edge ≥ 10%<br/>y ask ≤ 0.85?}
+    H[Orden BUY<br/>YES o NO]
+  end
+  A --> D
+  B --> D
+  D --> E
+  E --> F
+  C --> D
+  F --> G
+  G -->|Sí| H
+  G -->|No| D
+```
+
+**Lógica de la estrategia:**
+
+```mermaid
+flowchart TD
+  S[Escaneo cada 3s] --> M{Mercado 5M<br/>en ventana 3–20 min?}
+  M -->|No| S
+  M -->|Sí| T[Target: priceToBeat o Binance inicio 5m]
+  T --> B[Binance: precio actual, volatilidad 60×1m, drift]
+  B --> G[Monte Carlo GBM: 10 000 caminos hasta cierre]
+  G --> P[Prob YES = % caminos arriba del target]
+  P --> L[Libro: ask_yes, ask_no]
+  L --> EY{Edge YES<br/>prob_yes − ask_yes ≥ 10%?}
+  EY -->|Sí, ask_yes ≤ 0.85| BY[Comprar YES]
+  EY -->|No| EN{Edge NO<br/>prob_no − ask_no ≥ 10%?}
+  EN -->|Sí, ask_no ≤ 0.85| BN[Comprar NO]
+  EN -->|No| S
+  BY --> R[Registro + cooldown 30s]
+  BN --> R
+  R --> S
+```
+
+Documentación completa (parámetros, flujo, viabilidad): **[docs/ESTRATEGIA_MONTECARLO_SNIPER.md](docs/ESTRATEGIA_MONTECARLO_SNIPER.md)** · [Análisis de viabilidad](docs/VIABILIDAD_ESTRATEGIA_MONTECARLO.md).
+
+---
+
 ## 🔑 Configuración: API Keys
 
 El bot **nunca** incluye claves en el código. Todas se leen desde variables de entorno. La forma recomendada es un archivo **`.env`** que no se sube a git.
@@ -114,9 +181,9 @@ El **Monte Carlo Sniper** opera en mercados binarios de Polymarket del tipo *“
 
 - **Una sola instancia:** el script usa un lock file (`.sniper.lock`) para que solo corra un proceso.
 - **Un trade por señal:** tras enviar una orden hay cooldown y no se repite el mismo mercado.
-- **Máximo 10 USD y 10 shares** por operación para controlar riesgo.
+- **Máximo 10 USD y 10 shares** por operación para controlar riesgo (valores actuales en código: 1 USD, 2 shares).
 
-Detalle matemático y viabilidad: ver [docs/VIABILIDAD_ESTRATEGIA_MONTECARLO.md](docs/VIABILIDAD_ESTRATEGIA_MONTECARLO.md).
+Para nombre oficial, parámetros y ficha completa de la estrategia, ver la sección [Estrategia en producción: Monte Carlo Sniper](#-estrategia-en-producción-monte-carlo-sniper) más arriba y [docs/ESTRATEGIA_MONTECARLO_SNIPER.md](docs/ESTRATEGIA_MONTECARLO_SNIPER.md).
 
 ---
 
@@ -126,6 +193,7 @@ El proyecto incluye documentación técnica y simulaciones para evaluar viabilid
 
 | Documento | Contenido |
 |-----------|------------|
+| [docs/ESTRATEGIA_MONTECARLO_SNIPER.md](docs/ESTRATEGIA_MONTECARLO_SNIPER.md) | **Ficha de la estrategia en producción:** Monte Carlo Sniper (nombre, flujo, parámetros, auditoría). |
 | [docs/VIABILIDAD_ESTRATEGIA_MONTECARLO.md](docs/VIABILIDAD_ESTRATEGIA_MONTECARLO.md) | Viabilidad del Monte Carlo Sniper (GBM, edge, riesgo). |
 | [docs/ANALISIS_HISTORIAL_TRADES.md](docs/ANALISIS_HISTORIAL_TRADES.md) | Análisis del historial de trades del sniper. |
 | [docs/SIMULACION_DOUBLE_CHEAP_STRADDLE.md](docs/SIMULACION_DOUBLE_CHEAP_STRADDLE.md) | Simulación con datos reales del orderbook: estrategia "double-cheap straddle" (YES y NO baratos), captura de snapshots, análisis por umbral 0.30–0.35 y resultados. |
@@ -296,6 +364,7 @@ scripts/
 
 docs/
 ├── README.md                         ← Índice de documentación e investigación
+├── ESTRATEGIA_MONTECARLO_SNIPER.md   ← Ficha estrategia en producción (Monte Carlo Sniper)
 ├── VIABILIDAD_ESTRATEGIA_MONTECARLO.md   ← Viabilidad Monte Carlo Sniper
 ├── ANALISIS_HISTORIAL_TRADES.md      ← Análisis historial de trades
 └── SIMULACION_DOUBLE_CHEAP_STRADDLE.md   ← Simulación 2: double-cheap straddle (datos reales)

@@ -1,0 +1,19 @@
+[Unit]
+Description=PumaClaw Double-Cheap Straddle Bot (Polymarket)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/home/ubuntu
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/ubuntu/.openclaw/.env_straddle
+WorkingDirectory=/home/ubuntu/.openclaw/workspace/skills/polymarket
+ExecStart=/home/ubuntu/.openclaw/workspace/skills/polymarket/.venv/bin/python3 /home/ubuntu/.openclaw/workspace/skills/polymarket/scripts/doublecheap_straddle_bot.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/ubuntu/straddle_bot.log
+StandardError=append:/home/ubuntu/straddle_bot.log
+
+[Install]
+WantedBy=default.target
+

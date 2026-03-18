@@ -1,5 +1,10 @@
 # Análisis de viabilidad: Monte Carlo Sniper (Polymarket 5M)
 
+**Nombre oficial de la estrategia:** **Monte Carlo Sniper**  
+Ficha completa: [ESTRATEGIA_MONTECARLO_SNIPER.md](ESTRATEGIA_MONTECARLO_SNIPER.md).
+
+---
+
 ## Resumen ejecutivo
 
 | Aspecto | Valoración | Comentario |

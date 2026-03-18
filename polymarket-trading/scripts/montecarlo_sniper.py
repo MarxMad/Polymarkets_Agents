@@ -20,6 +20,7 @@ TRADED_MARKETS_FILE = os.path.expanduser("~/.openclaw/workspace/skills/polymarke
 LOCK_FILE = os.path.expanduser("~/.openclaw/workspace/skills/polymarket/.sniper.lock")
 
 def log_trade_to_file(trade_data):
+    trade_data["resolved"] = False
     try:
         history = []
         if os.path.exists(TRADES_LOG_FILE):
@@ -30,6 +31,56 @@ def log_trade_to_file(trade_data):
             json.dump(history, f, indent=4)
     except Exception as e:
         log.error(f"Error guardando auditoría de trade: {e}")
+
+
+def update_trades_resolutions():
+    """Actualiza el historial con el resultado (ganado/perdido) de mercados ya resueltos."""
+    if not os.path.exists(TRADES_LOG_FILE):
+        return
+    try:
+        with open(TRADES_LOG_FILE, "r") as f:
+            history = json.load(f)
+        unresolved = [i for i, t in enumerate(history) if not t.get("resolved") and t.get("market_id")]
+        if not unresolved:
+            return
+        updated = 0
+        for i in unresolved:
+            t = history[i]
+            mkt_id = t.get("market_id")
+            if not mkt_id:
+                continue
+            try:
+                r = requests.get(f"{GAMMA_API}/markets/{mkt_id}", timeout=5)
+                if r.status_code != 200:
+                    continue
+                m = r.json()
+                if not m.get("closed"):
+                    continue
+                prices = json.loads(m.get("outcomePrices", "[]"))
+                if len(prices) < 2:
+                    continue
+                yes_won = prices[0] == "1" or float(prices[0]) > 0.99
+                our_side = t.get("side", "")
+                won = (our_side == "YES" and yes_won) or (our_side == "NO" and not yes_won)
+                history[i]["resolved"] = True
+                history[i]["won"] = won
+                history[i]["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                history[i]["outcome_yes_won"] = yes_won
+                inv = float(t.get("investment", 0) or 0)
+                px = float(t.get("price", 1) or 1)
+                if won:
+                    history[i]["pnl"] = round(inv * (1.0 / px - 1.0), 2)
+                else:
+                    history[i]["pnl"] = round(-inv, 2)
+                updated += 1
+            except Exception:
+                continue
+        if updated:
+            with open(TRADES_LOG_FILE, "w") as f:
+                json.dump(history, f, indent=4)
+            log.info(f"📊 Resoluciones actualizadas: {updated} mercados (ganado/perdido en historial)")
+    except Exception as e:
+        log.debug(f"update_trades_resolutions: {e}")
 
 LAST_REDEEM_TIME = 0
 
@@ -42,25 +93,26 @@ log = logging.getLogger("MonteCarloSniper")
 
 load_dotenv(os.path.expanduser("~/.openclaw/.env"))
 
-# Telegram Config
+# Telegram Config (envía a ti: usa TELEGRAM_CHAT_ID o, si no existe, el primer ID de TELEGRAM_GROUP_IDS)
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or (os.getenv("TELEGRAM_GROUP_IDS") or "").strip().split(",")[0].strip() or None
 
 def send_telegram(msg):
-    if not TG_TOKEN or not TG_CHAT_ID: return
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         requests.post(url, json={"chat_id": TG_CHAT_ID, "text": f"🛡️ SNIPER: {msg}"}, timeout=5)
-    except:
+    except Exception:
         pass
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 PROXY_ADDRESS = os.getenv("PROXY_ADDRESS", "0x1294d2B89B08E8651124F04534FB2715a1437846")
 
-# Parámetros de Crecimiento Acelerado (v5.7 - Objetivo $1M)
-MAX_TRADE_USD = 10.00     # PROTEGIDO: $10.00 para balance de $315
-MAX_RISK_PER_TRADE = 0.05 # Máximo 5% del bankroll real
-MIN_EDGE_REQUIRED = 0.07  # AJUSTADO: 7% de ventaja (Mayor frecuencia de trades)
+# Parámetros conservadores (capital ~$50; proteger tras retiro de $500 ganancia)
+MAX_TRADE_USD = 1.00      # Máx $1 por operación para no bajar rápido
+MAX_RISK_PER_TRADE = 0.02 # Máximo 2% del bankroll
+MIN_EDGE_REQUIRED = 0.10  # 10% edge mínimo (reducir sangría: solo señales más fuertes; antes 0.07)
 SIMULACIONES = 10000      
 TRADED_MARKETS = set()    # MEMORIA: No repetir mercados (también persistido en disco)
 
@@ -120,6 +172,22 @@ def get_clob_client():
     return ClobClient("https://clob.polymarket.com", key=pk, chain_id=137, creds=creds, signature_type=2, funder=proxy)
 
 # ── Binance Data ──────────────────────────────────────────────────
+def get_binance_historical(ticker, iso_str):
+    """Precio de Binance al inicio del intervalo (para usar como target cuando la API no da priceToBeat)."""
+    try:
+        ts = int(datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp() * 1000)
+        symbol = BINANCE_TICKERS.get(ticker)
+        if not symbol:
+            return 0.0
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&startTime={ts}&limit=1"
+        r = requests.get(url, timeout=3).json()
+        if r and len(r) > 0:
+            return float(r[0][1])  # open del primer minuto
+        return 0.0
+    except Exception:
+        return 0.0
+
+
 def get_binance_data(ticker):
     """Obtiene precio actual y calcula volatilidad del último par de horas."""
     symbol = BINANCE_TICKERS.get(ticker)
@@ -193,22 +261,61 @@ def scan_and_trade(client):
         log.error(f"Falla de API Gamma: {e}")
         return
 
-    for ev in events:
+    # Diagnóstico: cuántos eventos pasan filtros (ticker + priceToBeat o fallback Binance + ventana 3–20 min)
+    n_events = len(events) if isinstance(events, list) else 0
+    n_with_target = 0
+    n_in_window = 0
+    for ev in events or []:
+        title = ev.get("title", "").lower()
+        ticker = "BTC" if "bitcoin" in title or "btc" in title else "ETH" if "ethereum" in title or "eth" in title else None
+        if not ticker:
+            continue
+        meta = ev.get("eventMetadata") or {}
+        ptb = float(meta.get("priceToBeat", 0))
+        if ptb <= 0:
+            start_str = ev.get("startTime") or (ev.get("markets") or [{}])[0].get("eventStartTime") or ev.get("startDate")
+            if start_str:
+                ptb = get_binance_historical(ticker, start_str)
+        if ptb <= 0:
+            continue
+        n_with_target += 1
+        for mkt in ev.get("markets", []):
+            try:
+                end_dt = datetime.fromisoformat(mkt.get("endDate", "").replace("Z", "+00:00"))
+                time_left_sec = (end_dt - now).total_seconds()
+                if 180 <= time_left_sec <= 1200:
+                    n_in_window += 1
+                    break
+            except Exception:
+                pass
+    if n_events > 0 and (n_with_target == 0 or n_in_window == 0):
+        log.info(f"📊 Eventos: {n_events} | Con target BTC/ETH: {n_with_target} | En ventana 3–20 min: {n_in_window} (edge>{MIN_EDGE_REQUIRED:.0%})")
+
+    for ev in events or []:
         title = ev.get("title", "").lower()
         ticker = "BTC" if "bitcoin" in title or "btc" in title else "ETH" if "ethereum" in title or "eth" in title else None
         
-        if not ticker: continue
+        if not ticker:
+            continue
         meta = ev.get("eventMetadata") or {}
         price_to_beat_raw = float(meta.get("priceToBeat", 0))
+        # Fallback: la API a menudo no envía eventMetadata; usar precio Binance al inicio del intervalo 5m
+        if price_to_beat_raw <= 0:
+            start_str = ev.get("startTime") or (ev.get("markets") or [{}])[0].get("eventStartTime") or ev.get("startDate")
+            if start_str:
+                price_to_beat_raw = get_binance_historical(ticker, start_str)
+                if price_to_beat_raw > 0:
+                    log.debug(f"Target desde Binance al inicio: {ticker} ${price_to_beat_raw:.2f}")
+        if price_to_beat_raw <= 0:
+            continue
         
         for mkt in ev.get("markets", []):
             try:
                 end_dt = datetime.fromisoformat(mkt.get("endDate").replace('Z', '+00:00'))
                 time_left_sec = (end_dt - now).total_seconds()
                 
-                # ESTRATEGIA v4.4: Solo 10-15 mins (Ignorar bajo 7 mins)
-                # Esto da tiempo a que la estadística se estabilice.
-                if time_left_sec < 420 or time_left_sec > 1200:
+                # ESTRATEGIA v4.6: Ventana 3–20 min (los que tienen target son los que ya empezaron → quedan 3–5 min; 5 min excluía todos)
+                if time_left_sec < 180 or time_left_sec > 1200:
                     continue
                 
                 mkt_id = mkt.get("id")
@@ -222,7 +329,7 @@ def scan_and_trade(client):
                 current_px, vol, drift = get_binance_data(ticker)
                 if not current_px: continue
                 
-                price_to_beat = price_to_beat_raw if price_to_beat_raw > 0 else current_px
+                price_to_beat = price_to_beat_raw
                 
                 # Simular! (v5.1 Motor de Máxima Velocidad: 100% de tendencia)
                 # Seguimos la tendencia real al 100% para capturar momentum.
@@ -261,6 +368,9 @@ def scan_and_trade(client):
                     ask_price = ask_no
                     token_to_buy = tids[1]
                     mc_prob = mc_prob_no
+
+                if not side_to_buy and (edge_yes > 0 or edge_no > 0):
+                    log.info(f"   Edge insuficiente (mín {MIN_EDGE_REQUIRED:.0%}): YES={edge_yes:.2%} ask={ask_yes:.2f} | NO={edge_no:.2%} ask={ask_no:.2f}")
                     
                 if side_to_buy:
                     log.info(f"🚀 ALERTA EDGE PROFUNDO: Comprar {side_to_buy} a {ask_price:.3f} | Prob Real: {mc_prob:.3f} | Edge: {best_edge:.3f}")
@@ -290,27 +400,22 @@ def scan_and_trade(client):
                     except:
                         current_bankroll = 1.0 
                     
-                    # CAP ESTRICTO: máximo MAX_TRADE_USD ($10) en coste Y máximo 10 shares (lo que muestra Polymarket como "Apuesta")
-                    # Así "Apuesta" en la UI nunca supera $10 y el coste real tampoco.
-                    max_shares = 10.0
+                    # CAP $1: máximo 1 USD por operación (capital ~$50)
+                    max_shares = 2.0   # a 0.5 = $1; evita notional grande
                     trade_usd = MAX_TRADE_USD
 
-                    if trade_usd > current_bankroll or trade_usd < 1.0:
+                    if trade_usd > current_bankroll or current_bankroll < 5.0:
                         log.warning(f"Saldo insuficiente: trade ${trade_usd} > balance ${current_bankroll}")
                         continue
 
                     shares = round(trade_usd / ask_price, 2)
-                    # Nunca más de 10 shares: evita que Polymarket muestre "Apuesta: $19" (notional = shares)
                     shares = min(shares, max_shares)
                     trade_usd = round(shares * ask_price, 2)
 
-                    # Mínimo 5 shares para que el CLOB acepte (sin superar 10)
-                    if shares < 5.0:
-                        shares = min(5.0, max_shares)
+                    # Mínimo 1 share para que el CLOB acepte; tope $1
+                    if shares < 1.0:
+                        shares = 1.0
                         trade_usd = round(shares * ask_price, 2)
-                        log.info(f"Ajustando a mínimo 5 shares. Inversión: ${trade_usd:.2f}")
-
-                    # Tope final: por si acaso, nunca más de MAX_TRADE_USD ni más de max_shares
                     if trade_usd > MAX_TRADE_USD:
                         trade_usd = MAX_TRADE_USD
                         shares = min(round(trade_usd / ask_price, 2), max_shares)
@@ -327,7 +432,7 @@ def scan_and_trade(client):
                         order = client.create_order(OrderArgs(price=ask_price, size=shares, side="BUY", token_id=token_to_buy))
                         resp = client.post_order(order)
                         log.info(f"✅ ORDEN REAL ENVIADA: {resp}")
-                        msg = f"🚀 COMPRA EJECUTADA\nMercado: {ticker} ({side_to_buy})\nPrecio: {ask_price} | {shares} shares\nInversión: ${trade_usd:.2f} USD (máx $10)\nProb MC: {mc_prob:.1%}"
+                        msg = f"🚀 COMPRA EJECUTADA\nMercado: {ticker} ({side_to_buy})\nPrecio: {ask_price} | {shares} shares\nInversión: ${trade_usd:.2f} USD (máx $1)\nProb MC: {mc_prob:.1%}"
                         send_telegram(msg)
                         
                         # Auditoría: registrar en disco ANTES de añadir a TRADED_MARKETS (orden único)
@@ -355,14 +460,21 @@ def scan_and_trade(client):
             except Exception as e:
                 log.error(f"Error procesando mercado: {e}")
 
+RESOLUTION_CHECK_SEC = 300  # Actualizar resultados de mercados resueltos cada 5 min
+
 def main():
     log.info("Iniciando Motor Cuantitativo Monte Carlo de Polymarket...")
     lock_fd = acquire_lock()
     load_traded_markets()
     client = get_clob_client()
+    last_resolution_check = 0.0
     try:
         while True:
             auto_redeem_if_needed(client)
+            now_sec = time.time()
+            if now_sec - last_resolution_check >= RESOLUTION_CHECK_SEC:
+                update_trades_resolutions()
+                last_resolution_check = now_sec
             scan_and_trade(client)
             time.sleep(3)
     finally:
