@@ -25,3 +25,10 @@ sniper.log
 
 # Mac
 .DS_Store
+
+# Temporales locales de análisis (no versionar)
+.tmp/
+.tmp_analysis/
+.tmp_straddle/
+.tmp_straddle2/
+.tmp_straddle3/
