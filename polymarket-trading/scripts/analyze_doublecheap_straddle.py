@@ -7,6 +7,7 @@ from collections import defaultdict
 import requests
 
 GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
 IN_FILE = os.path.expanduser(os.getenv("OB_IN_FILE", "~/orderbook_snapshots.jsonl"))
 
 # Simulación de gestión del "hit 1":
@@ -35,6 +36,12 @@ else:
 MODE = os.getenv("OB_MODE", "usd").strip().lower()
 USD_PER_LEG = float(os.getenv("OB_USD_PER_LEG", "1.0"))
 SHARES_PER_LEG = float(os.getenv("OB_SHARES_PER_LEG", "1.0"))
+
+# Fees (CLOB): para crypto, la doc indica feeRate=0.25 y exponent=2.
+# Usamos /fee-rate?token_id=... (base_fee en bps) para no hardcodear.
+FEE_ENABLED = os.getenv("OB_FEES_ENABLED", "1").strip() not in ("0", "false", "no", "")
+FEE_EXPONENT = int(os.getenv("OB_FEE_EXPONENT", "2"))
+FEE_MIN_USDC = float(os.getenv("OB_FEE_MIN_USDC", "0.0001"))
 
 
 def parse_lines(path: str):
@@ -104,6 +111,41 @@ def fetch_resolution(market_id: str, cache: dict) -> bool | None:
         return None
 
 
+def fetch_fee_rate_bps(token_id: str, cache: dict) -> int:
+    """Devuelve base_fee (bps) desde CLOB /fee-rate. Si falla, 0."""
+    if not token_id:
+        return 0
+    if token_id in cache:
+        return cache[token_id]
+    try:
+        r = requests.get(f"{CLOB_API}/fee-rate", params={"token_id": token_id}, timeout=5)
+        if not r.ok:
+            cache[token_id] = 0
+            return 0
+        j = r.json() or {}
+        bps = int(j.get("base_fee") or 0)
+        cache[token_id] = bps
+        return bps
+    except Exception:
+        cache[token_id] = 0
+        return 0
+
+
+def fee_usdc(shares: float, price: float, base_fee_bps: int) -> float:
+    """Fee en USDC según fórmula oficial: C×p×feeRate×(p(1-p))^exp. Redondeo 4dp, min 0.0001."""
+    if not FEE_ENABLED or base_fee_bps <= 0:
+        return 0.0
+    if shares <= 0 or price <= 0 or price >= 1:
+        return 0.0
+    fee_rate = base_fee_bps / 10000.0
+    raw = shares * price * fee_rate * ((price * (1.0 - price)) ** FEE_EXPONENT)
+    # precisión: 4 decimales; mínimo 0.0001 USDC
+    f = round(raw, 4)
+    if 0 < f < FEE_MIN_USDC:
+        f = FEE_MIN_USDC
+    return f
+
+
 def main():
     if not os.path.exists(IN_FILE):
         raise SystemExit(f"No existe {IN_FILE}")
@@ -113,6 +155,8 @@ def main():
         "ticker": None,
         "question": None,
         "endDate": None,
+        "token_yes": None,
+        "token_no": None,
         "rows": [],  # (ts_num, yes_ask, no_ask, yes_bid, no_bid)
     })
 
@@ -131,6 +175,8 @@ def main():
         p["ticker"] = p["ticker"] or o.get("ticker")
         p["question"] = p["question"] or o.get("question")
         p["endDate"] = p["endDate"] or o.get("endDate")
+        p["token_yes"] = p["token_yes"] or o.get("token_yes")
+        p["token_no"] = p["token_no"] or o.get("token_no")
         if ts is not None:
             p["rows"].append((ts, ya, na, yb, nb))
 
@@ -169,16 +215,22 @@ def main():
                     break
         return {"first": first, "touches": touches, "min": min_ask}
 
-    def _pnl_theoretical(first_yes, first_no):
+    fee_cache = {}
+
+    def _pnl_theoretical(first_yes, first_no, token_yes: str | None, token_no: str | None):
         """PnL teórico si llenan ambas piernas a esos asks (sin fees/slippage)."""
-        py = first_yes[1]
-        pn = first_no[1]
+        py = float(first_yes[1])
+        pn = float(first_no[1])
         if MODE == "shares":
             cost = SHARES_PER_LEG * py + SHARES_PER_LEG * pn
-            return SHARES_PER_LEG - cost
-        shares_yes = USD_PER_LEG / py if py > 0 else 0
-        shares_no = USD_PER_LEG / pn if pn > 0 else 0
-        return max(shares_yes, shares_no) - 2 * USD_PER_LEG
+            fee_y = fee_usdc(SHARES_PER_LEG, py, fetch_fee_rate_bps(token_yes or "", fee_cache))
+            fee_n = fee_usdc(SHARES_PER_LEG, pn, fetch_fee_rate_bps(token_no or "", fee_cache))
+            return (SHARES_PER_LEG - cost) - (fee_y + fee_n)
+        shares_yes = USD_PER_LEG / py if py > 0 else 0.0
+        shares_no = USD_PER_LEG / pn if pn > 0 else 0.0
+        fee_y = fee_usdc(shares_yes, py, fetch_fee_rate_bps(token_yes or "", fee_cache))
+        fee_n = fee_usdc(shares_no, pn, fetch_fee_rate_bps(token_no or "", fee_cache))
+        return (max(shares_yes, shares_no) - 2 * USD_PER_LEG) - (fee_y + fee_n)
 
     def _first_touch(rows_ask, limit):
         """Devuelve (ts, ask) del primer snapshot con ask<=limit; o None."""
@@ -224,22 +276,28 @@ def main():
                 return (ts, bid)
         return None
 
-    def _pnl_one_leg_exit(price_buy, price_sell):
-        """PnL de una pierna comprada y luego vendida (sin fees)."""
+    def _pnl_one_leg_exit(price_buy, price_sell, token_id: str | None):
+        """PnL de una pierna comprada y luego vendida (incluye fees)."""
+        pb = float(price_buy)
+        ps = float(price_sell)
+        bps = fetch_fee_rate_bps(token_id or "", fee_cache)
         if MODE == "shares":
-            # Si compras SHARES_PER_LEG a price_buy y vendes al price_sell.
-            return SHARES_PER_LEG * (price_sell - price_buy)
-        if not price_buy or price_buy <= 0:
+            fee_buy = fee_usdc(SHARES_PER_LEG, pb, bps)
+            fee_sell = fee_usdc(SHARES_PER_LEG, ps, bps)
+            return SHARES_PER_LEG * (ps - pb) - (fee_buy + fee_sell)
+        if pb <= 0:
             return 0.0
-        shares = USD_PER_LEG / price_buy
-        return shares * price_sell - USD_PER_LEG
+        shares = USD_PER_LEG / pb
+        fee_buy = fee_usdc(shares, pb, bps)
+        fee_sell = fee_usdc(shares, ps, bps)
+        return shares * ps - USD_PER_LEG - (fee_buy + fee_sell)
 
     print("=== DOUBLE-CHEAP STRADDLE (simulación 2 con snapshots reales) ===")
     print(f"Archivo: {IN_FILE}")
     print(f"Líneas leídas: {n_lines}")
     print(f"Umbrales evaluados: {', '.join(f'{x:.2f}' for x in LIMITS)}")
     print(f"Modo: {MODE} | usd_per_leg={USD_PER_LEG} | shares_per_leg={SHARES_PER_LEG}")
-    print(f"Sim hit-1: timeout={HIT1_TIMEOUT_SEC:.0f}s | salida=bid@timeout (sin fees)")
+    print(f"Sim hit-1: timeout={HIT1_TIMEOUT_SEC:.0f}s | salida=bid@timeout ({'con fees' if FEE_ENABLED else 'sin fees'})")
     print(f"Sim opción2 filtro: confirm={HIT2_CONFIRM_SEC:.0f}s | other_within=+{HIT2_OTHER_WITHIN:.2f} (ask)")
     print()
     print(f"Markets únicos: {len(markets)}")
@@ -284,6 +342,8 @@ def main():
 
         for m in markets:
             ticker = (m.get("ticker") or "—").upper()
+            tok_yes = m.get("token_yes")
+            tok_no = m.get("token_no")
             rows = m["rows"]
             # Garantizar orden temporal
             rows_sorted = sorted(rows, key=lambda r: (r[0] is None, r[0]))
@@ -299,7 +359,7 @@ def main():
                 hits_both += 1
                 order = "YES->NO" if ys["first"][0] <= ns["first"][0] else "NO->YES"
                 orders[order] += 1
-                pnl_hits.append(_pnl_theoretical(ys["first"], ns["first"]))
+                pnl_hits.append(_pnl_theoretical(ys["first"], ns["first"], tok_yes, tok_no))
             elif has_yes or has_no:
                 hits_one += 1
                 # Precio al que habríamos comprado la pierna barata (primer touch)
@@ -319,13 +379,13 @@ def main():
                 other_touch = _first_touch_within(no_rows, limit, t0, t0 + HIT1_TIMEOUT_SEC)
                 if other_touch:
                     sim_convert_to_both += 1
-                    sim_pnl_converted.append(_pnl_theoretical(first_yes, other_touch))
+                    sim_pnl_converted.append(_pnl_theoretical(first_yes, other_touch, tok_yes, tok_no))
                 else:
                     # Stop: salir de YES al bid tras timeout
                     bid = _bid_at_or_after(yes_bids, t0 + HIT1_TIMEOUT_SEC)
                     if bid and isinstance(bid[1], (int, float)):
                         sim_stopped_one_leg += 1
-                        sim_pnl_stops.append(_pnl_one_leg_exit(p0, bid[1]))
+                        sim_pnl_stops.append(_pnl_one_leg_exit(p0, bid[1], tok_yes))
 
                 # Opción 2 (filtro): solo "disparamos" si NO se acerca primero
                 confirm = _first_below_within(
@@ -344,8 +404,8 @@ def main():
                     if other_touch2:
                         sim2_convert_to_both += 1
                         sim2_by_ticker[ticker]["conv"] += 1
-                        _p = _pnl_theoretical(first_yes, other_touch2)
-                        sim2_pnl_converted.append(_pnl_theoretical(first_yes, other_touch2))
+                        _p = _pnl_theoretical(first_yes, other_touch2, tok_yes, tok_no)
+                        sim2_pnl_converted.append(_p)
                         sim2_by_ticker[ticker]["pnl_conv"] += _p
                         if _p > 1e-9:
                             sim2_by_ticker[ticker]["wins"] += 1
@@ -358,8 +418,8 @@ def main():
                         if bid2 and isinstance(bid2[1], (int, float)):
                             sim2_stopped_one_leg += 1
                             sim2_by_ticker[ticker]["stops"] += 1
-                            _p = _pnl_one_leg_exit(p0, bid2[1])
-                            sim2_pnl_stops.append(_pnl_one_leg_exit(p0, bid2[1]))
+                            _p = _pnl_one_leg_exit(p0, bid2[1], tok_yes)
+                            sim2_pnl_stops.append(_p)
                             sim2_by_ticker[ticker]["pnl_stop"] += _p
                             if _p > 1e-9:
                                 sim2_by_ticker[ticker]["wins"] += 1
@@ -373,12 +433,12 @@ def main():
                 other_touch = _first_touch_within(yes_rows, limit, t0, t0 + HIT1_TIMEOUT_SEC)
                 if other_touch:
                     sim_convert_to_both += 1
-                    sim_pnl_converted.append(_pnl_theoretical(other_touch, first_no))
+                    sim_pnl_converted.append(_pnl_theoretical(other_touch, first_no, tok_yes, tok_no))
                 else:
                     bid = _bid_at_or_after(no_bids, t0 + HIT1_TIMEOUT_SEC)
                     if bid and isinstance(bid[1], (int, float)):
                         sim_stopped_one_leg += 1
-                        sim_pnl_stops.append(_pnl_one_leg_exit(p0, bid[1]))
+                        sim_pnl_stops.append(_pnl_one_leg_exit(p0, bid[1], tok_no))
 
                 confirm = _first_below_within(
                     yes_rows,
@@ -394,8 +454,8 @@ def main():
                     if other_touch2:
                         sim2_convert_to_both += 1
                         sim2_by_ticker[ticker]["conv"] += 1
-                        _p = _pnl_theoretical(other_touch2, first_no)
-                        sim2_pnl_converted.append(_pnl_theoretical(other_touch2, first_no))
+                        _p = _pnl_theoretical(other_touch2, first_no, tok_yes, tok_no)
+                        sim2_pnl_converted.append(_p)
                         sim2_by_ticker[ticker]["pnl_conv"] += _p
                         if _p > 1e-9:
                             sim2_by_ticker[ticker]["wins"] += 1
@@ -408,8 +468,8 @@ def main():
                         if bid2 and isinstance(bid2[1], (int, float)):
                             sim2_stopped_one_leg += 1
                             sim2_by_ticker[ticker]["stops"] += 1
-                            _p = _pnl_one_leg_exit(p0, bid2[1])
-                            sim2_pnl_stops.append(_pnl_one_leg_exit(p0, bid2[1]))
+                            _p = _pnl_one_leg_exit(p0, bid2[1], tok_no)
+                            sim2_pnl_stops.append(_p)
                             sim2_by_ticker[ticker]["pnl_stop"] += _p
                             if _p > 1e-9:
                                 sim2_by_ticker[ticker]["wins"] += 1

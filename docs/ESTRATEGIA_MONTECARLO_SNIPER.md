@@ -89,11 +89,25 @@ El bot solo entra cuando el **libro** (lo que paga el mercado) está por debajo 
 | Ventana hasta cierre | min–max segundos hasta `endDate` | 180–1200 (3–20 min) |
 | Edge mínimo | Mínimo prob − ask para entrar | 0.10 (10%) |
 | Ask máximo | No comprar si ask > este valor | 0.85 |
-| Máx. USD por trade | Tope por operación | 1.00 USD |
-| Máx. shares por trade | Tope de tamaño | 2 |
+| **Escala por saldo** | USD por operación según balance de la cuenta | Ver tabla abajo |
 | Simulaciones GBM | Número de caminos Monte Carlo | 10 000 |
 | Cooldown tras trade | Segundos antes de siguiente escaneo | 30 |
 | Lock file | Una sola instancia en ejecución | `.sniper.lock` |
+
+### Escala de tamaño por saldo (cuenta)
+
+El tamaño por operación **sube con el saldo** de la wallet (USDC en Polygon):
+
+| Saldo (USD) | USD por operación | Máx. shares |
+|-------------|-------------------|--------------|
+| &lt; 20 | 1 | 2 |
+| 20 – 29 | 2 | 4 |
+| 30 – 39 | 3 | 6 |
+| 40 – 49 | 4 | 8 |
+| … | +1 cada 10 USD | 2 × USD |
+| ≥ 90 | 10 (tope) | 20 |
+
+Variables en código: `BASE_TRADE_USD=1`, `TRADE_USD_AT_20=2`, `TRADE_USD_STEP=10`, `MAX_TRADE_USD_CAP=10`.
 
 La wallet y las API keys se cargan desde `~/.openclaw/.env` (o la ruta configurada en el script).
 

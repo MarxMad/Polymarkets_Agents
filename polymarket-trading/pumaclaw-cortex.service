@@ -1,0 +1,17 @@
+[Unit]
+Description=PumaClaw Neural Cortex Dashboard (Polymarket)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/.openclaw/workspace/skills/polymarket/scripts
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/.openclaw/workspace/skills/polymarket/.venv/bin/python3 /home/ubuntu/.openclaw/workspace/skills/polymarket/scripts/montecarlo_cortex.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/ubuntu/cortex.log
+StandardError=append:/home/ubuntu/cortex.log
+
+[Install]
+WantedBy=default.target
+

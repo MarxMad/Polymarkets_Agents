@@ -109,12 +109,24 @@ def send_telegram(msg):
 GAMMA_API = "https://gamma-api.polymarket.com"
 PROXY_ADDRESS = os.getenv("PROXY_ADDRESS", "0x1294d2B89B08E8651124F04534FB2715a1437846")
 
-# Parámetros conservadores (capital ~$50; proteger tras retiro de $500 ganancia)
-MAX_TRADE_USD = 1.00      # Máx $1 por operación para no bajar rápido
+# Parámetros conservadores
+# Tamaño fijo: el usuario pidió NO escalar por saldo; mantener $2 por operación.
+FIXED_TRADE_USD = 2.00
+FIXED_MAX_SHARES = 4.0  # ~2 shares por USD de tamaño
 MAX_RISK_PER_TRADE = 0.02 # Máximo 2% del bankroll
-MIN_EDGE_REQUIRED = 0.10  # 10% edge mínimo (reducir sangría: solo señales más fuertes; antes 0.07)
+MIN_EDGE_REQUIRED = 0.10  # 10% edge mínimo
+EDGE_BUFFER = 0.03        # Colchón por fricción/modelo: exige +3pp extra de edge
+MIN_MARKET_AGE_SEC = 120  # Evita entrar en los primeros 2 minutos del mercado
 SIMULACIONES = 10000      
 TRADED_MARKETS = set()    # MEMORIA: No repetir mercados (también persistido en disco)
+
+
+def get_trade_size_usd(balance: float) -> tuple[float, float]:
+    """
+    Tamaño fijo por operación (sin escala por saldo).
+    Devuelve (trade_usd, max_shares) para usar en la orden.
+    """
+    return (FIXED_TRADE_USD, FIXED_MAX_SHARES)
 
 BINANCE_TICKERS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
 
@@ -201,14 +213,18 @@ def get_binance_data(ticker):
         # Velas de 1 minuto para calcular volatilidad (últimas 60 velas)
         r_kl = requests.get(f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=60", timeout=3).json()
         
-        closes = [float(k[4]) for k in r_kl]
-        returns = np.diff(closes) / closes[:-1] # Retornos porcentuales por minuto
-        
-        # Volatilidad anualizada (asumiendo 525600 minutos en un año)
-        volatility = np.std(returns) * np.sqrt(525600)
-        
-        # Drift (tendencia a corto plazo)
-        drift = np.mean(returns) * 525600
+        closes = np.array([float(k[4]) for k in r_kl], dtype=float)
+        if len(closes) < 10:
+            return current_price, None, None
+        returns = np.diff(np.log(closes))  # Log-returns por minuto (más estables)
+
+        # Volatilidad anualizada con piso/techo para evitar extremos de ruido.
+        volatility = float(np.std(returns) * np.sqrt(525600))
+        volatility = max(0.10, min(volatility, 2.50))
+
+        # Drift anualizado acotado para reducir sesgo por momentum de muy corto plazo.
+        drift = float(np.mean(returns) * 525600)
+        drift = max(-1.0, min(drift, 1.0))
         
         return current_price, volatility, drift
     except Exception as e:
@@ -245,6 +261,17 @@ def monte_carlo_probability(current_price, target_price, time_to_expiry_sec, vol
     prob_yes = wins / simulations
     
     return prob_yes
+
+
+def stable_monte_carlo_probability(current_price, target_price, time_to_expiry_sec, volatility, drift):
+    """
+    Reduce sesgo de tendencia mezclando:
+    - escenario con drift estimado (30%)
+    - escenario neutro drift=0 (70%)
+    """
+    p_with_drift = monte_carlo_probability(current_price, target_price, time_to_expiry_sec, volatility, drift)
+    p_neutral = monte_carlo_probability(current_price, target_price, time_to_expiry_sec, volatility, 0.0)
+    return 0.30 * p_with_drift + 0.70 * p_neutral
 
 def scan_and_trade(client):
     log.info("🔍 Escaneando mercados para simulación Monte Carlo...")
@@ -314,9 +341,19 @@ def scan_and_trade(client):
                 end_dt = datetime.fromisoformat(mkt.get("endDate").replace('Z', '+00:00'))
                 time_left_sec = (end_dt - now).total_seconds()
                 
-                # ESTRATEGIA v4.6: Ventana 3–20 min (los que tienen target son los que ya empezaron → quedan 3–5 min; 5 min excluía todos)
+                # ESTRATEGIA: Ventana 3–20 min + evitar entrada demasiado temprano.
                 if time_left_sec < 180 or time_left_sec > 1200:
                     continue
+                start_str = mkt.get("eventStartTime") or ev.get("startTime") or ev.get("startDate")
+                if start_str:
+                    try:
+                        start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                        age_sec = (now - start_dt).total_seconds()
+                        if age_sec < MIN_MARKET_AGE_SEC:
+                            log.info(f"⏳ [{ticker}] Skip early-entry: age={age_sec:.0f}s (<{MIN_MARKET_AGE_SEC}s)")
+                            continue
+                    except Exception:
+                        pass
                 
                 mkt_id = mkt.get("id")
                 if mkt_id in TRADED_MARKETS:
@@ -331,9 +368,8 @@ def scan_and_trade(client):
                 
                 price_to_beat = price_to_beat_raw
                 
-                # Simular! (v5.1 Motor de Máxima Velocidad: 100% de tendencia)
-                # Seguimos la tendencia real al 100% para capturar momentum.
-                mc_prob_yes = monte_carlo_probability(current_px, price_to_beat, time_left_sec, vol, drift) 
+                # Simulación robusta: blend neutral + drift para reducir sesgo.
+                mc_prob_yes = stable_monte_carlo_probability(current_px, price_to_beat, time_left_sec, vol, drift)
                 mc_prob_no = 1.0 - mc_prob_yes
                 
                 log.info(f"🎲 [{ticker}] MC Sim -> YES: {mc_prob_yes:.1%} | NO: {mc_prob_no:.1%} | Quedan {time_left_sec:.0f}s (Dif: {current_px - price_to_beat:.2f})")
@@ -346,8 +382,8 @@ def scan_and_trade(client):
                 ask_no = min([float(a.price) for a in book_no.asks]) if book_no.asks else 0.99
                 
                 # Edge de YES
-                edge_yes = mc_prob_yes - ask_yes
-                edge_no = mc_prob_no - ask_no
+                edge_yes = mc_prob_yes - ask_yes - EDGE_BUFFER
+                edge_no = mc_prob_no - ask_no - EDGE_BUFFER
                 
                 side_to_buy = None
                 best_edge = 0
@@ -385,9 +421,8 @@ def scan_and_trade(client):
                     
                     # Obtener balance real para el cálculo
                     try:
-                        # Usar Web3 directo para el balance (más fiable para el proxy)
                         rpc_list = ["https://polygon-bor-rpc.publicnode.com", "https://rpc.ankr.com/polygon"]
-                        current_bankroll = 1.0 # Default conservador
+                        current_bankroll = 1.0
                         for rpc in rpc_list:
                             try:
                                 w3 = Web3(Web3.HTTPProvider(rpc))
@@ -397,27 +432,25 @@ def scan_and_trade(client):
                                 current_bankroll = bal_raw / 1e6
                                 if current_bankroll > 0: break
                             except: continue
-                    except:
-                        current_bankroll = 1.0 
-                    
-                    # CAP $1: máximo 1 USD por operación (capital ~$50)
-                    max_shares = 2.0   # a 0.5 = $1; evita notional grande
-                    trade_usd = MAX_TRADE_USD
+                    except Exception:
+                        current_bankroll = 1.0
+
+                    # Escala por saldo: < 20 → 1 USD; >= 20 → 2 USD; cada 10 USD más → +1 USD (tope MAX_TRADE_USD_CAP)
+                    cap_usd, max_shares = get_trade_size_usd(current_bankroll)
+                    trade_usd = cap_usd
 
                     if trade_usd > current_bankroll or current_bankroll < 5.0:
-                        log.warning(f"Saldo insuficiente: trade ${trade_usd} > balance ${current_bankroll}")
+                        log.warning(f"Saldo insuficiente: trade ${trade_usd} > balance ${current_bankroll:.2f}")
                         continue
 
                     shares = round(trade_usd / ask_price, 2)
                     shares = min(shares, max_shares)
                     trade_usd = round(shares * ask_price, 2)
-
-                    # Mínimo 1 share para que el CLOB acepte; tope $1
                     if shares < 1.0:
                         shares = 1.0
                         trade_usd = round(shares * ask_price, 2)
-                    if trade_usd > MAX_TRADE_USD:
-                        trade_usd = MAX_TRADE_USD
+                    if trade_usd > cap_usd:
+                        trade_usd = cap_usd
                         shares = min(round(trade_usd / ask_price, 2), max_shares)
                         trade_usd = round(shares * ask_price, 2)
                     if shares > max_shares:
@@ -425,14 +458,13 @@ def scan_and_trade(client):
                         trade_usd = round(shares * ask_price, 2)
 
                     # Log de auditoría
-                    log.info(f"💰 Ejecutando trade: ${trade_usd:.2f} USD ({shares} shares @ {ask_price:.3f}) en {side_to_buy} | Bankroll: ${current_bankroll:.2f}")
+                    log.info(f"💰 Ejecutando trade: ${trade_usd:.2f} USD ({shares} shares @ {ask_price:.3f}) en {side_to_buy} | Bankroll: ${current_bankroll:.2f} (tamaño máx ${cap_usd:.2f})")
                     
-                    # Descomentar para activar trading real:
                     try:
                         order = client.create_order(OrderArgs(price=ask_price, size=shares, side="BUY", token_id=token_to_buy))
                         resp = client.post_order(order)
                         log.info(f"✅ ORDEN REAL ENVIADA: {resp}")
-                        msg = f"🚀 COMPRA EJECUTADA\nMercado: {ticker} ({side_to_buy})\nPrecio: {ask_price} | {shares} shares\nInversión: ${trade_usd:.2f} USD (máx $1)\nProb MC: {mc_prob:.1%}"
+                        msg = f"🚀 COMPRA EJECUTADA\nMercado: {ticker} ({side_to_buy})\nPrecio: {ask_price} | {shares} shares\nInversión: ${trade_usd:.2f} USD (máx ${cap_usd:.2f} por saldo ${current_bankroll:.0f})\nProb MC: {mc_prob:.1%}"
                         send_telegram(msg)
                         
                         # Auditoría: registrar en disco ANTES de añadir a TRADED_MARKETS (orden único)

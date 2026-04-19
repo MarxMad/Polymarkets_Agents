@@ -4,9 +4,21 @@ After=network-online.target
 
 [Service]
 Type=simple
+User=ubuntu
+Group=ubuntu
 Environment=HOME=/home/ubuntu
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=/home/ubuntu/.openclaw/.env_straddle
+Environment=POLY_ENV_FILE=/home/ubuntu/.openclaw/.env_straddle
+Environment=STRADDLE_USD_PER_LEG=2
+Environment=STRADDLE_MAX_SHARES_PER_LEG=6
+Environment=STRADDLE_LIMIT=0.35
+Environment=STRADDLE_OTHER_WITHIN=0.02
+Environment=STRADDLE_CONFIRM_SEC=60
+Environment=STRADDLE_TIMEOUT_SEC=45
+Environment="STRADDLE_STRATEGY_NAME=STRADDLE O2-FILTRO v3"
+Environment=STRADDLE_TRADES_LOG_FILE=/home/ubuntu/trades_history_straddle.json
+Environment=STRADDLE_TRADED_MARKETS_FILE=/home/ubuntu/traded_markets_straddle.json
+Environment=STRADDLE_LOCK_FILE=/home/ubuntu/straddle.lock
 WorkingDirectory=/home/ubuntu/.openclaw/workspace/skills/polymarket
 ExecStart=/home/ubuntu/.openclaw/workspace/skills/polymarket/.venv/bin/python3 /home/ubuntu/.openclaw/workspace/skills/polymarket/scripts/doublecheap_straddle_bot.py
 Restart=always
