@@ -1,13 +1,13 @@
 <div align="center">
   <img src="https://polymarket.com/_next/image?url=%2Fimages%2Fhomepage%2Fhero-bg.webp&w=3840&q=75" alt="Polymarket Banner" width="100%">
 
-  # 🎯 PumaClaw: Monte Carlo Sniper
-  **Autonomous Quantitative Trading for Polymarket (Polygon)**
+  # 🎯 PumaClaw — Polymarket (Polygon)
+  **Research cuantitativo y trading autónomo**
 
   <p align="center">
     <i>The bridge between crowd sentiment and mathematical reality.</i>
     <br>
-    <b>Strategy:</b> Geometric Brownian Motion · <b>Markets:</b> BTC/ETH 5‑min · <b>Max bet:</b> $10 USD
+    <b>En producción:</b> Monte Carlo Sniper (GBM, BTC/ETH 5m) · <b>Dashboard:</b> Cortex (Dash) · <b>Research:</b> straddle, snapshots, Binance 5m
   </p>
 </div>
 
@@ -31,12 +31,14 @@
    python3 montecarlo_sniper.py
    ```
 
-4. **Abre el dashboard** para ver la simulación en vivo:
+4. **Abre el dashboard Cortex** (simulación en vivo + laboratorios):
    ```bash
    ./abrir_dashboard.sh   # desde la raíz del repo (túnel SSH + cortex en AWS)
    # o local: python3 polymarket-trading/scripts/montecarlo_cortex.py
    ```
    Luego visita **http://localhost:8050**.
+
+5. **Roadmap en GitHub** (milestones: research cripto, Cortex, expansión política/deportes/clima/economía): [docs/GITHUB_ROADMAP.md](docs/GITHUB_ROADMAP.md).
 
 ---
 
@@ -287,16 +289,49 @@ El bot cuenta cuántos caminos terminan por encima del “price to beat” y con
 
 ---
 
-## 💻 Dashboard en vivo
+## 💻 Dashboard Cortex (`montecarlo_cortex.py`)
 
-El **dashboard** (`montecarlo_cortex.py`) muestra en tiempo real:
+App **Dash / Plotly** en el puerto **8050**. Además del motor en vivo del sniper, incluye:
 
-- **Enjambre de caminos:** líneas verdes (precio por encima del target al cierre) y rojas (por debajo).
-- **Línea target:** precio a batir para que gane YES.
-- **Distribución** de precios al vencimiento (histograma) y probabilidad YES.
-- **Balance** (USDC + posiciones) y log de señales.
+| Área | Contenido |
+|------|------------|
+| **Sniper (vivo)** | Caminos GBM, target, histograma terminal, probabilidad YES estable, asks, sparkline de P(YES), balance y señales. |
+| **Straddle** | Métricas y tabla del bot double-cheap straddle (cuando está activo y registrando). |
+| **Laboratorio Sniper** | Inputs (spot, strike, vol, drift, asks, `min_edge`, `edge_buffer`, sims, fees) → veredicto (SKIP/AMBER/GREEN), EV, histograma de PnL simulado, curva de equity ilustrativa. Carga desde motor en vivo o último snapshot JSONL (+ Gamma/Binance). |
+| **Laboratorio Straddle** | Parámetros (`timeout`, USD por pierna, `limit_price`, etc.) → simulación y ranking; gráfico de top resultados del optimizador. |
+| **Estilo** | Inputs con texto oscuro sobre fondo claro para legibilidad. |
 
-Para usarlo en la nube (recomendado): `./abrir_dashboard.sh` desde la raíz del repo (túnel SSH a tu instancia y cortex en AWS). Luego **http://localhost:8050**.
+**Arranque local:** `python3 polymarket-trading/scripts/montecarlo_cortex.py`  
+**Nube (recomendado):** `./abrir_dashboard.sh` (túnel SSH) → **http://localhost:8050**. Servicio de ejemplo: `polymarket-trading/pumaclaw-cortex.service`.
+
+---
+
+## 📈 Datos Binance 5m (90 días) y análisis
+
+En el repo hay CSV exportados desde la API pública de Binance y documentación asociada:
+
+| Recurso | Ruta |
+|---------|------|
+| Velas 5m BTC / ETH (90d) | `polymarket-trading/data/binance/btcusdt_5m_90d.csv`, `ethusdt_5m_90d.csv` |
+| Resumen OHLC | [docs/BINANCE_5M_ULTIMOS_90D.md](docs/BINANCE_5M_ULTIMOS_90D.md) |
+| Rachas consecutivas (verde/rojo) y **volatilidad por hora UTC** | [docs/BINANCE_5M_90D_RACHAS_Y_VOL_HORA.md](docs/BINANCE_5M_90D_RACHAS_Y_VOL_HORA.md) |
+| Scripts | `polymarket-trading/scripts/binance_5m_candle_stats.py` (descarga + stats), `analyze_binance_5m_csv.py` (rachas y vol por hora) |
+
+No sustituyen el CLOB de Polymarket; sirven para calibrar **ruido y horarios** en ventanas de 5 minutos.
+
+---
+
+## 🧪 Otros scripts de research (cripto 5m)
+
+| Script | Uso breve |
+|--------|-----------|
+| `straddle_optimizer.py` | Grid search de parámetros straddle sobre `orderbook_snapshots.jsonl`. |
+| `straddle_snapshot_binance_bridge.py` | Join snapshots + Binance, surrogate RF, simulación sintética larga (ver [docs/STRADDLE_SNAPSHOT_BINANCE_BRIDGE.md](docs/STRADDLE_SNAPSHOT_BINANCE_BRIDGE.md)). |
+| `sniper_param_search_on_snapshots.py` | Búsqueda paramétrica del sniper sobre JSONL. |
+| `compare_straddle_sniper_on_snapshots.py` | Comparación rápida straddle vs sniper en el mismo histórico. |
+| `recuento_operaciones_sniper.py` | Recuento de operaciones sniper desde `trades_history.json`. |
+
+Dependencias extra del puente: `polymarket-trading/requirements-bridge.txt`.
 
 ---
 
@@ -344,30 +379,41 @@ Abre **http://localhost:8050** en el navegador.
 ```text
 polymarket-trading/
 ├── SKILL.md                           ← Comandos OpenClaw
+├── data/binance/                      ← CSV velas 5m (ej. btcusdt_5m_90d.csv)
+├── requirements-bridge.txt            ← sklearn/joblib para puente snapshot–Binance
 ├── scripts/
 │   ├── montecarlo_sniper.py           ← [CORE] Bot Monte Carlo (opera en 5M)
-│   ├── montecarlo_cortex.py           ← [DASH] Dashboard en vivo
+│   ├── montecarlo_cortex.py           ← [DASH] Cortex: sniper + straddle + laboratorios
 │   ├── montecarlo_viz.py              ← [LEGACY] Viz alternativo
-│   ├── orderbook_recorder.py          ← [RESEARCH] Graba snapshots del orderbook (JSONL)
-│   ├── analyze_doublecheap_straddle.py← [RESEARCH] Análisis double-cheap straddle
-│   ├── trader.py                     ← Agente LLM
-│   ├── contrarian_scalper.py         ← Scalper contrarian
-│   ├── blind_sniper.py               ← Sniper ciego
-│   └── liquidate_*.py                ← Redenciones / panic
-├── pumaclaw-sniper.service            ← Servicio systemd sniper
-├── pumaclaw-orderbook-recorder.service← Servicio systemd recorder (investigación)
-├── pumaclaw-*.service                ← Otros daemons
-└── strategy.json                     ← Parámetros
+│   ├── orderbook_recorder.py          ← [RESEARCH] Snapshots orderbook → JSONL
+│   ├── analyze_doublecheap_straddle.py← [RESEARCH] Double-cheap straddle
+│   ├── binance_5m_candle_stats.py     ← Descarga Binance 5m + stats
+│   ├── analyze_binance_5m_csv.py      ← Rachas y volatilidad por hora UTC
+│   ├── straddle_optimizer.py          ← Grid search straddle
+│   ├── straddle_snapshot_binance_bridge.py ← Puente snapshots + Binance + surrogate
+│   ├── sniper_param_search_on_snapshots.py
+│   ├── compare_straddle_sniper_on_snapshots.py
+│   ├── doublecheap_straddle_bot.py    ← Bot straddle (opcional)
+│   ├── recuento_operaciones_sniper.py
+│   ├── trader.py                      ← Agente LLM
+│   └── …
+├── pumaclaw-sniper.service
+├── pumaclaw-cortex.service            ← Dashboard Cortex (systemd)
+├── pumaclaw-orderbook-recorder.service
+└── pumaclaw-straddle.service
 
 scripts/
-├── deploy_and_start_sniper.sh        ← Deploy + arranque del sniper en EC2
+└── deploy_and_start_sniper.sh
 
 docs/
-├── README.md                         ← Índice de documentación e investigación
-├── ESTRATEGIA_MONTECARLO_SNIPER.md   ← Ficha estrategia en producción (Monte Carlo Sniper)
-├── VIABILIDAD_ESTRATEGIA_MONTECARLO.md   ← Viabilidad Monte Carlo Sniper
-├── ANALISIS_HISTORIAL_TRADES.md      ← Análisis historial de trades
-└── SIMULACION_DOUBLE_CHEAP_STRADDLE.md   ← Simulación 2: double-cheap straddle (datos reales)
+├── README.md
+├── GITHUB_ROADMAP.md                  ← Milestones e issues (#1–#13)
+├── BINANCE_5M_ULTIMOS_90D.md
+├── BINANCE_5M_90D_RACHAS_Y_VOL_HORA.md
+├── STRADDLE_SNAPSHOT_BINANCE_BRIDGE.md
+├── ESTRATEGIA_MONTECARLO_SNIPER.md
+├── SIMULACION_DOUBLE_CHEAP_STRADDLE.md
+└── …
 ```
 
 ---
